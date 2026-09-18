@@ -11,9 +11,17 @@ from credit.datasets.gen_2.channel_utils import resolve_num_levels
 logger = logging.getLogger(__name__)
 
 
+def _first_data_source(conf):
+    """Return the first data.source block (ERA5 if present, else WBERA5, etc.)."""
+    sources = conf["data"]["source"]
+    if "ERA5" in sources:
+        return sources["ERA5"]
+    return next(iter(sources.values()))
+
+
 def _build_channel_map(conf):
     """Return a dict mapping variable name -> list of channel indices in the output tensor."""
-    src = conf["data"]["source"]["ERA5"]
+    src = _first_data_source(conf)
     n_levels = resolve_num_levels(src, conf)
     v = src["variables"]
     prog = v.get("prognostic") or {}
@@ -38,7 +46,7 @@ def _build_denorm_stats(conf):
     import numpy as np
     import xarray as xr
 
-    src = conf["data"]["source"]["ERA5"]
+    src = _first_data_source(conf)
     levels = src.get("levels")  # None/[] -> "all levels" (loaded straight from the norm file)
     level_coord = src["level_coord"]
     n_levels = resolve_num_levels(src, conf)
@@ -89,6 +97,30 @@ def _build_denorm_stats(conf):
         stds.append(s)
 
     return __import__("numpy").concatenate(means), __import__("numpy").concatenate(stds)
+
+
+def _field_map_from_processed(processed: dict) -> dict:
+    """Map short variable names to tensors in a y_processed-style nested dict."""
+    out = {}
+    for _src, variables in (processed or {}).items():
+        if not isinstance(variables, dict):
+            continue
+        for var_key, tensor in variables.items():
+            out[var_key.split("/")[-1]] = tensor
+            out[var_key] = tensor
+    return out
+
+
+def _spatial_numpy(tensor, level_idx: int = 0):
+    """Reduce a (B, level, time, H, W) tensor to a 2-D numpy map."""
+    t = tensor.detach().cpu().float()
+    if t.ndim == 5:
+        t = t[0]
+    if t.ndim == 4:
+        t = t[min(level_idx, t.shape[0] - 1)]
+    if t.ndim == 3:
+        t = t[0]
+    return t.numpy()
 
 
 def _plot(args) -> None:
@@ -195,29 +227,71 @@ def _plot(args) -> None:
     y_pred_np = _squeeze(y_pred).numpy()
 
     unit_label = "normalised"
+    processed_truth = None
+    processed_pred = None
     if args.denorm:
-        mean_arr, std_arr = _build_denorm_stats(conf)
-        mean_arr = mean_arr[:, None, None]
-        std_arr = std_arr[:, None, None]
-        y_true_np = y_true_np * std_arr + mean_arr
-        y_pred_np = y_pred_np * std_arr + mean_arr
-        unit_label = "physical units"
-        logger.info("Inverse-normalised outputs to physical units")
+        preblocks_cfg = conf.get("preblocks") or {}
+        has_mean_std = bool(
+            (preblocks_cfg.get("per_step") or {}).get("norm", {}).get("args", {}).get("mean_path")
+            or (preblocks_cfg.get("norm") or {}).get("args", {}).get("mean_path")
+        )
+        post_cfg = (conf.get("postblocks") or {}).get("per_step") or {}
+        if post_cfg:
+            from credit.postblock import apply_postblocks, build_postblocks
+
+            plot_batch = dict(_batch)
+            plot_batch["y_pred"] = y_pred
+            plot_batch = apply_postblocks(build_postblocks(conf, phase="per_step"), plot_batch)
+            processed_pred = _field_map_from_processed(plot_batch.get("y_processed"))
+            processed_truth = _field_map_from_processed(plot_batch.get("y_target_processed"))
+            if processed_pred and processed_truth:
+                unit_label = "physical units"
+                logger.info("Inverse-normalised via postblocks (BridgeScaler / reconstruct)")
+            else:
+                print(
+                    "ERROR: --denorm: postblocks did not produce y_processed and y_target_processed.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        elif has_mean_std:
+            mean_arr, std_arr = _build_denorm_stats(conf)
+            mean_arr = mean_arr[:, None, None]
+            std_arr = std_arr[:, None, None]
+            y_true_np = y_true_np * std_arr + mean_arr
+            y_pred_np = y_pred_np * std_arr + mean_arr
+            unit_label = "physical units"
+            logger.info("Inverse-normalised outputs to physical units")
+        else:
+            print(
+                "ERROR: --denorm needs either postblocks inverse scaler "
+                "(tiny.yaml / gen2 BridgeScaler) or preblocks mean_path/std_path. "
+                "Omit --denorm to plot normalised values.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     channel_map = _build_channel_map(conf)
 
     for field in args.field:
-        if field not in channel_map:
-            available = ", ".join(sorted(channel_map.keys()))
-            print(f"Field '{field}' not found. Available: {available}", file=sys.stderr)
-            continue
+        if processed_pred is not None:
+            if field not in processed_pred or field not in processed_truth:
+                available = ", ".join(sorted(k for k in processed_pred if "/" not in k))
+                print(f"Field '{field}' not found. Available: {available}", file=sys.stderr)
+                continue
+            truth = _spatial_numpy(processed_truth[field], args.level)
+            pred = _spatial_numpy(processed_pred[field], args.level)
+            level_idx = args.level
+        else:
+            if field not in channel_map:
+                available = ", ".join(sorted(channel_map.keys()))
+                print(f"Field '{field}' not found. Available: {available}", file=sys.stderr)
+                continue
 
-        chans = channel_map[field]
-        level_idx = min(args.level, len(chans) - 1)
-        c = chans[level_idx]
-
-        truth = y_true_np[c]
-        pred = y_pred_np[c]
+            chans = channel_map[field]
+            level_idx = min(args.level, len(chans) - 1)
+            c = chans[level_idx]
+            truth = y_true_np[c]
+            pred = y_pred_np[c]
         diff = pred - truth
 
         H, W = truth.shape
@@ -228,7 +302,7 @@ def _plot(args) -> None:
         vmax = float(np.percentile(truth, 98))
         dabs = float(np.percentile(np.abs(diff), 98))
 
-        title_suffix = f"  level {level_idx}" if len(chans) > 1 else ""
+        title_suffix = f"  level {level_idx}" if (processed_pred is None and len(channel_map.get(field, [])) > 1) else ""
         ckpt_epoch = ckpt.get("epoch", "?")
         fig_title = f"{field}{title_suffix}  |  epoch {ckpt_epoch}  |  {unit_label}"
 
